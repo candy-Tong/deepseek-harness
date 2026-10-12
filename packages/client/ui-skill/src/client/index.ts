@@ -16,15 +16,19 @@
  *
  * Catalog fetches are cached per session (the small twin of the ui-commands
  * directory): the per-keystroke candidates re-poll filters a settled
- * snapshot locally, so one session costs one RPC. The scope-birth warm hook
- * prewarms the session's key; a preset switch drops that one key (the
- * catalog is the preset's, and a blank session may switch after the warm);
- * connection/reset clears everything — the host
- * catalog may differ across generations. A shared in-flight fetch
- * deliberately outlives any single menu interaction: closing the menu must
- * not kill the prewarm other consumers will hit, so it carries its own
- * abort (fired only on invalidation/teardown) while a candidates caller
- * with an aborted signal just returns early.
+ * snapshot locally, so one session costs one RPC until the host says the
+ * catalog changed. `skills/change` refetches every cached session on its own
+ * abort handle. It does not replace the shared promise, does not abort the
+ * RPC a caller already awaits, and does not drop a snapshot that is already
+ * serving. The snapshot is replaced only when that refetch arrives; a failed
+ * refetch leaves the snapshot and the shared promise as they are. The scope-birth warm hook prewarms the
+ * session's key; a preset switch drops that one key (the catalog is the
+ * preset's, and a blank session may switch after the warm); connection/reset
+ * clears everything — the host catalog may differ across generations. A
+ * shared in-flight fetch deliberately outlives any single menu interaction:
+ * closing the menu must not kill the prewarm other consumers will hit, so it
+ * carries its own abort (fired only on invalidation/teardown) while a
+ * candidates caller with an aborted signal just returns early.
  * Catalog RPCs retain an existing Client Session through completion and
  * wait for its initial history open to succeed before contacting the Host.
  *
@@ -65,7 +69,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 interface CatalogFetch {
   readonly promise: Promise<readonly SkillEntry[]>
   readonly abort: AbortController
-  /** Settled catalog for synchronous lexicon reads (unset while in flight or on failure). */
+  /** Settled catalog for synchronous lexicon reads (unset until the first success). */
   settled?: readonly SkillEntry[]
 }
 
@@ -88,6 +92,11 @@ export function apply(ctx: ClientContext): void {
   // Session-keyed catalog cache; single-flight per key. Plugin-closure state:
   // the fiber effect below is its teardown boundary.
   const fetches = new Map<SessionId, CatalogFetch>()
+  // Background skills/change refetches. They never replace the shared fetch.
+  const refreshes = new Map<SessionId, { readonly abort: AbortController; readonly epoch: number }>()
+  // Sessions whose refetch has already published. The original promise must not
+  // write an older catalog over that snapshot.
+  const refreshPublished = new Set<SessionId>()
   // Per-session lexicon invalidation listeners (subscribeLexicon consumers).
   const lexiconListeners = new Map<SessionId, Set<() => void>>()
 
@@ -104,37 +113,50 @@ export function apply(ctx: ClientContext): void {
     }
   }
 
+  // One catalog RPC. The shared fetch and a background refetch each pass their own signal.
+  const loadCatalog = (sessionId: SessionId, signal: AbortSignal): Promise<readonly SkillEntry[]> => (async () => {
+    if (sessions.binding(sessionId) === undefined) {
+      throw new Error(`skill catalog requires a retained session "${sessionId}"`)
+    }
+    return sessions.using(sessionId, { source: 'skillCatalog', signal }, async (reference) => {
+      signal.throwIfAborted()
+      const state = reference.binding.session.getSnapshot()
+      if (state.openState !== 'open') {
+        throw state.openError ?? new Error(`session "${sessionId}" is not open`)
+      }
+      const result = await skills.list({ sessionId }, signal)
+      signal.throwIfAborted()
+      if (!result.ok) throw new Error(`skills/list failed: ${result.error.code}: ${result.error.message}`)
+      return result.value.skills
+    })
+  })()
+
+  // Drop a background refetch and forget that it published, so a later fetch can settle.
+  const stopRefresh = (key: SessionId): void => {
+    const flight = refreshes.get(key)
+    refreshPublished.delete(key)
+    if (flight === undefined) return
+    refreshes.delete(key)
+    flight.abort.abort()
+  }
+
   const fetchCatalog = (sessionId: SessionId): CatalogFetch => {
     const existing = fetches.get(sessionId)
     if (existing !== undefined) return existing
     const abort = new AbortController()
-    const promise = (async () => {
-      if (sessions.binding(sessionId) === undefined) {
-        throw new Error(`skill catalog requires a retained session "${sessionId}"`)
-      }
-      return sessions.using(sessionId, { source: 'skillCatalog', signal: abort.signal }, async (reference) => {
-        abort.signal.throwIfAborted()
-        const state = reference.binding.session.getSnapshot()
-        if (state.openState !== 'open') {
-          throw state.openError ?? new Error(`session "${sessionId}" is not open`)
-        }
-        const result = await skills.list({ sessionId }, abort.signal)
-        abort.signal.throwIfAborted()
-        if (!result.ok) throw new Error(`skills/list failed: ${result.error.code}: ${result.error.message}`)
-        return result.value.skills
-      })
-    })()
+    const promise = loadCatalog(sessionId, abort.signal)
     const entry: CatalogFetch = { promise, abort }
     fetches.set(sessionId, entry)
     promise.then(
-      // Settled snapshot backs the synchronous lexicon reads.
-      (skills) => {
-        entry.settled = skills
+      (catalog) => {
+        if (fetches.get(sessionId) !== entry || refreshPublished.has(sessionId)) return
+        entry.settled = catalog
         notifyLexicon(sessionId)
       },
-      // A failed fetch must not poison the key: the next consumer retries.
       () => {
-        if (fetches.get(sessionId) === entry) fetches.delete(sessionId)
+        if (fetches.get(sessionId) !== entry || entry.settled !== undefined) return
+        fetches.delete(sessionId)
+        stopRefresh(sessionId)
       },
     )
     return entry
@@ -145,11 +167,36 @@ export function apply(ctx: ClientContext): void {
     if (entry === undefined) return
     fetches.delete(key)
     entry.abort.abort()
+    stopRefresh(key)
     notifyLexicon(key)
   }
 
   const clearAll = (): void => {
     for (const key of [...fetches.keys()]) invalidate(key)
+  }
+
+  // Refetch cached sessions without replacing the shared promise or its abort handle.
+  const refreshTouched = (): void => {
+    for (const [sessionId, entry] of fetches) {
+      const previous = refreshes.get(sessionId)
+      const epoch = (previous?.epoch ?? 0) + 1
+      previous?.abort.abort()
+      const abort = new AbortController()
+      refreshes.set(sessionId, { abort, epoch })
+      const promise = loadCatalog(sessionId, abort.signal)
+      promise.then(
+        (catalog) => {
+          if (fetches.get(sessionId) !== entry || refreshes.get(sessionId)?.epoch !== epoch) return
+          refreshPublished.add(sessionId)
+          entry.settled = catalog
+          notifyLexicon(sessionId)
+        },
+        () => {
+          if (refreshes.get(sessionId)?.epoch !== epoch) return
+          refreshes.delete(sessionId)
+        },
+      )
+    }
   }
 
   // The bound translate resolves against the registered dictionaries with the
@@ -162,12 +209,15 @@ export function apply(ctx: ClientContext): void {
     order: 2,
     async candidates(session, { query, signal }) {
       if (sessions.subagentAddress(session.sessionId) !== undefined) return []
-      const skills = await fetchCatalog(session.sessionId).promise
+      const entry = fetchCatalog(session.sessionId)
+      // A settled snapshot is filtered locally. The shared promise is awaited
+      // only until the first success; a background refetch does not replace it.
+      const catalog = entry.settled ?? await entry.promise
       // Superseded keystroke: the shared fetch stays warm, this caller yields.
       if (signal.aborted) return []
       // The same ranking as the command group of this menu: case-insensitive
       // ordered subsequence, prefix hits first.
-      return rankByName(skills, query)
+      return rankByName(catalog, query)
         .map(skill => ({
           name: skill.name,
           // The user-only marker rides the description (the menu's only
@@ -225,6 +275,7 @@ export function apply(ctx: ClientContext): void {
     },
   }
   const inputTriggers = ctx.get('inputTriggers') as InputTriggerServiceContract
+  ctx.remote.$on('skills/change', refreshTouched)
   // A preset decides which skill providers an agent reads, so a switched
   // session's cached catalog belongs to the composition it no longer runs.
   ctx.remote.$on('agent-preset/selected', invalidate)

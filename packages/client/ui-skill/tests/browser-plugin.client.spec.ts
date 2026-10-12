@@ -5,7 +5,7 @@
  * the source behavior contract driven directly on the captured source with
  * real ClientSessionContext projections — sessionId addressing, the
  * session-keyed catalog cache (single-flight per key, scope-birth warm
- * prewarm, connection/reset clear), shared fuzzy name ranking, RPC-failure
+ * prewarm, skills/change soft refresh, connection/reset clear), shared fuzzy name ranking, RPC-failure
  * rejection, pick → plain-text outcome (the plain-text-reference decision:
  * .agents/notes/archived/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md),
  * the synchronous
@@ -364,6 +364,109 @@ describe('catalog cache', () => {
     await source.candidates(proj('s1'), req(''))
     await source.candidates(proj('s2'), req(''))
     expect(payloads).toHaveLength(4)
+  })
+
+  it('skills/change keeps the settled snapshot until the refetch arrives', async () => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const calls: object[] = []
+    const refreshed: SkillRow[] = [
+      ...CATALOG,
+      { name: 'c4-codebase-architecture', description: 'architecture', modelInvocable: true },
+    ]
+    const list: ListFn = (payload) => {
+      calls.push(payload)
+      if (calls.length === 1) return listOk(CATALOG)(payload)
+      return gate.then(() => listOk(refreshed)(payload))
+    }
+    const { source, remote } = await bench(list)
+    const listener = vi.fn()
+    source.subscribeLexicon!(proj('s1'), listener)
+    await source.candidates(proj('s1'), req(''))
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(source.lexicon!(proj('s1'))).toEqual(['commit-helper', 'code-review', 'deploy'])
+    remote.emit('skills/change', [])
+    await vi.waitFor(() => { expect(calls).toHaveLength(2) })
+    expect(source.lexicon!(proj('s1'))).toEqual(['commit-helper', 'code-review', 'deploy'])
+    expect(listener).toHaveBeenCalledTimes(1)
+    // The open menu keeps filtering the snapshot. It does not wait for the refetch.
+    await expect(source.candidates(proj('s1'), req('c4'))).resolves.toEqual([])
+    expect(calls).toHaveLength(2)
+    release!()
+    await vi.waitFor(() => { expect(listener).toHaveBeenCalledTimes(2) })
+    expect(source.lexicon!(proj('s1'))).toEqual([
+      'commit-helper', 'code-review', 'deploy', 'c4-codebase-architecture',
+    ])
+    await expect(source.candidates(proj('s1'), req('c4'))).resolves.toEqual([
+      expect.objectContaining({ name: 'c4-codebase-architecture' }),
+    ])
+    expect(calls).toHaveLength(2)
+  })
+
+  it('skills/change does not abort a candidates call already awaiting the first RPC', async () => {
+    let releaseFirst: (() => void) | undefined
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const calls: object[] = []
+    const list: ListFn = (payload, signal) => {
+      calls.push(payload)
+      if (calls.length === 1) {
+        return new Promise((resolve, reject) => {
+          const fail = () => reject(signal?.reason ?? new Error('aborted'))
+          if (signal?.aborted) { fail(); return }
+          signal?.addEventListener('abort', fail, { once: true })
+          void firstGate.then(() => {
+            signal?.removeEventListener('abort', fail)
+            if (signal?.aborted) { fail(); return }
+            resolve(listOk(CATALOG)(payload))
+          })
+        })
+      }
+      return listOk(CATALOG)(payload)
+    }
+    const { source, remote } = await bench(list)
+    const pending = source.candidates(proj('s1'), req(''))
+    await vi.waitFor(() => { expect(calls).toHaveLength(1) })
+    remote.emit('skills/change', [])
+    await vi.waitFor(() => { expect(calls).toHaveLength(2) })
+    releaseFirst!()
+    await expect(pending).resolves.toHaveLength(3)
+  })
+
+  it('a failed skills/change refresh keeps the previous lexicon', async () => {
+    const calls: object[] = []
+    const list: ListFn = (payload) => {
+      calls.push(payload)
+      if (calls.length === 1) return listOk(CATALOG)(payload)
+      return Promise.reject(new Error('refresh failed'))
+    }
+    const { source, remote } = await bench(list)
+    await source.candidates(proj('s1'), req(''))
+    remote.emit('skills/change', [])
+    await vi.waitFor(() => { expect(calls).toHaveLength(2) })
+    for (let step = 0; step < 8; step += 1) await Promise.resolve()
+    expect(source.lexicon!(proj('s1'))).toEqual(['commit-helper', 'code-review', 'deploy'])
+    await expect(source.candidates(proj('s1'), req('deploy'))).resolves.toEqual([
+      expect.objectContaining({ name: 'deploy' }),
+    ])
+    expect(calls).toHaveLength(2)
+  })
+
+  it('connection/reset aborts an in-flight skills/change refresh', async () => {
+    let refreshSignal: AbortSignal | undefined
+    const calls: object[] = []
+    const list: ListFn = (payload, signal) => {
+      calls.push(payload)
+      if (calls.length === 1) return listOk(CATALOG)(payload)
+      refreshSignal = signal
+      return new Promise(() => {})
+    }
+    const { ctx, source, remote } = await bench(list)
+    await source.candidates(proj('s1'), req(''))
+    remote.emit('skills/change', [])
+    await vi.waitFor(() => { expect(calls).toHaveLength(2) })
+    expect(refreshSignal?.aborted).toBe(false)
+    ctx.emit('connection/reset')
+    expect(refreshSignal?.aborted).toBe(true)
   })
 })
 

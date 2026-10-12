@@ -18,11 +18,16 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./events": {
+      "types": "./lib/types/events.d.ts",
+      "default": "./lib/types/events.js"
+    },
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
+    "lib/types/events.js",
     "lib/types/**/*.d.ts"
   ],
   "license": "MIT",

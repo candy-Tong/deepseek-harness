@@ -43,6 +43,9 @@
       "path": "../../schedule/schedule"
     },
     {
+      "path": "../../skill/skill"
+    },
+    {
       "path": "../../feedback/message-feedback"
     },
     {
